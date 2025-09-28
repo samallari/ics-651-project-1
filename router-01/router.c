@@ -40,19 +40,56 @@ typedef struct {
 
 iface_send_slot_t send_slots[MAX_TTYS];
 
+// send thread args
+typedef struct {
+    int fd;
+    char *data;
+    int numbytes;
+} send_arg_t;
 
-// data handler with IP processing and routing
-static void data_handler(int tty, const void *vdata, int numbytes) {
-    const char *data = (const char *) vdata;
+// send thread, spawns a thread to send data, releases slot when done
+void *send_thread(void *arg) {
+    send_arg_t *s = arg;
+    // actually send via SLIP
+    write_slip_data(s->fd, s->data, s->numbytes);
 
-    printf("tty %d, ", tty);
-    print_packet("slip received packet", data, numbytes);
+    // release slot
+    pthread_mutex_lock(&send_slots[s->fd].lock);
+    send_slots[s->fd].in_use = 0;
+    pthread_mutex_unlock(&send_slots[s->fd].lock);
 
+    free(s->data);
+    free(s);
+    return NULL;
+}
+
+// helper function to queue a send operation
+void enqueue_send(int fd, const char *data, int numbytes) {
+    pthread_mutex_lock(&send_slots[fd].lock);
+    if (send_slots[fd].in_use) {
+        printf("Dropping packet on interface %d (busy)\n", fd);
+        pthread_mutex_unlock(&send_slots[fd].lock);
+        return;
+    }
+    send_slots[fd].in_use = 1;
+    pthread_mutex_unlock(&send_slots[fd].lock);
+
+    // copy packet
+    send_arg_t *arg = malloc(sizeof(send_arg_t));
+    arg->fd = fd;
+    arg->data = malloc(numbytes);
+    memcpy(arg->data, data, numbytes);
+    arg->numbytes = numbytes;
+
+    // spawn send thread
+    pthread_t tid;
+    pthread_create(&tid, NULL, send_thread, arg);
+    pthread_detach(tid);
 }
 
 // timer thread for periodic routing updates. this thread wakes up every 30 seconds, builds a routing packet, then sends it out all interfaces
-void *timer_thread(void *arg) {
-    int num_ifaces = *(int *) arg;
+void *timer_thread(void *n_ifaces) {
+    int num_ifaces = *(int *) n_ifaces;
     while (1) {
         sleep(30);
 
@@ -66,6 +103,17 @@ void *timer_thread(void *arg) {
         }
     }
     return NULL;
+}
+
+// data handler starts receive thread with IP processing and routing, spawns send threads as needed
+static void data_handler(int tty, const void *vdata, int numbytes) {
+    const char *data = (const char *) vdata;
+
+    printf("tty %d, ", tty);
+    print_packet("slip received packet", data, numbytes);
+
+    // for now, echo back the received packet
+    enqueue_send(tty, data, numbytes);
 }
 
 int main(int argc, char *argv[]) {
@@ -121,7 +169,6 @@ int main(int argc, char *argv[]) {
         inet_ntop(AF_INET6, &simulators[i], addr_str, sizeof(addr_str)); // Convert address to string for printing
 
         // open SLIP interface
-        
         printf("Setting up a SLIP data handler on interface: %s\n", addr_str);
         slip_fds[i] = install_slip_data_handler(i, data_handler);
         if (slip_fds[i] < 0) {
