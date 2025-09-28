@@ -47,10 +47,10 @@ typedef struct {
     int numbytes;
 } send_arg_t;
 
-// send thread, spawns a thread to send data, releases slot when done
+// writes data to SLIP interface, releases slot when done
 void *send_thread(void *arg) {
     send_arg_t *s = arg;
-    // actually send via SLIP
+    fprint("[Send] Sending packet on interface %d\n", s->fd);
     write_slip_data(s->fd, s->data, s->numbytes);
 
     // release slot
@@ -63,18 +63,19 @@ void *send_thread(void *arg) {
     return NULL;
 }
 
-// helper function to queue a send operation
-void enqueue_send(int fd, const char *data, int numbytes) {
+// send thread helper function, used to queue a send operation on an interface
+void queue_send(int fd, const char *data, int numbytes) {
+    // check if interface is busy (i.e. a send thread is active)
     pthread_mutex_lock(&send_slots[fd].lock);
     if (send_slots[fd].in_use) {
         printf("Dropping packet on interface %d (busy)\n", fd);
         pthread_mutex_unlock(&send_slots[fd].lock);
         return;
-    }
+    } // else, add to send queue
     send_slots[fd].in_use = 1;
     pthread_mutex_unlock(&send_slots[fd].lock);
 
-    // copy packet
+    // copy packet to send
     send_arg_t *arg = malloc(sizeof(send_arg_t));
     arg->fd = fd;
     arg->data = malloc(numbytes);
@@ -82,9 +83,9 @@ void enqueue_send(int fd, const char *data, int numbytes) {
     arg->numbytes = numbytes;
 
     // spawn send thread
-    pthread_t tid;
-    pthread_create(&tid, NULL, send_thread, arg);
-    pthread_detach(tid);
+    pthread_t send_tid;
+    pthread_create(&send_tid, NULL, send_thread, arg);
+    pthread_detach(send_tid);
 }
 
 // timer thread for periodic routing updates. this thread wakes up every 30 seconds, builds a routing packet, then sends it out all interfaces
@@ -94,12 +95,14 @@ void *timer_thread(void *n_ifaces) {
         sleep(30);
 
         pthread_mutex_lock(&routing_lock);
-        // TODO: build routing announcement packet
+        // TODO: access routing table
         pthread_mutex_unlock(&routing_lock);
 
+        // TODO: build routing announcement packet
+
         for (int i = 0; i < num_ifaces; i++) {
-            // TODO: enqueue_send(i, &announce_packet);
-            printf("[Timer] would send routing update on iface %d\n", i);
+            // TODO: queue_send(i, &announce_packet);
+            printf("[Timer] Sending a routing packet on interface %d\n", i);
         }
     }
     return NULL;
@@ -113,7 +116,7 @@ static void data_handler(int tty, const void *vdata, int numbytes) {
     print_packet("slip received packet", data, numbytes);
 
     // for now, echo back the received packet
-    enqueue_send(tty, data, numbytes);
+    queue_send(tty, data, numbytes);
 }
 
 int main(int argc, char *argv[]) {
