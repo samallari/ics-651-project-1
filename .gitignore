@@ -50,5 +50,5 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
-router-01/router_backup.c
+router_backup.c
 *.DS_Store
