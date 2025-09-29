@@ -256,6 +256,56 @@ void remove_expired_routes() {
     pthread_mutex_unlock(&routing_lock);
 }
 
+
+/**
+ * Look up route in routing table for a destination address
+ * Returns the index of the matching route, or -1 if not found
+ */
+int lookup_route(const struct in6_addr *dest_addr, struct in6_addr *next_hop) {
+    pthread_mutex_lock(&routing_lock);
+
+    // Get network prefix of destination (first 64 bits)
+    struct in6_addr dest_prefix;
+    get_network_prefix(dest_addr, &dest_prefix);
+
+    // Search for matching route
+    int route_index = -1;
+    for (int i = 0; i < num_routes; i++) {
+        // Compare first 64 bits (8 bytes) of destination
+        if (memcmp(&routing_table[i].destination, &dest_prefix, 8) == 0) {
+            // Found a matching route
+            *next_hop = routing_table[i].gateway;
+            route_index = i;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&routing_lock);
+    return route_index;
+}
+
+/**
+ * Find which interface can reach a given gateway address
+ * Returns the interface index, or -1 if not found
+ */
+int find_output_interface(const struct in6_addr *gateway) {
+    // Check which interface is on the same network as the gateway
+    struct in6_addr gateway_prefix;
+    get_network_prefix(gateway, &gateway_prefix);
+
+    for (int i = 0; i < num_addrs; i++) {
+        struct in6_addr iface_prefix;
+        get_network_prefix(&sim_addrs[i], &iface_prefix);
+
+        // Compare first 64 bits to see if on same network
+        if (memcmp(&gateway_prefix, &iface_prefix, 8) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
 // ============================================================================
 // NETWORK PACKET HANDLING
 // ============================================================================
@@ -285,7 +335,7 @@ void queue_send(int fd, const char *data, int numbytes) {
     // Check if interface is busy
     pthread_mutex_lock(&send_slots[fd].lock);
     if (send_slots[fd].in_use) {
-        printf("Dropping packet on interface %d (busy)\n", fd);
+        printf("[Send] Dropping packet on interface %d (busy)\n", fd);
         pthread_mutex_unlock(&send_slots[fd].lock);
         return;
     }
@@ -311,13 +361,13 @@ void queue_send(int fd, const char *data, int numbytes) {
 void process_routing_packet(const char *data, int numbytes, const struct in6_addr *src_addr) {
     char src_str[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, src_addr, src_str, sizeof(src_str));
-    
-    printf("Received a routing protocol packet from %s\n", src_str);
-    
+
+    printf("[Recv] Received a routing protocol packet from %s\n", src_str);
+
     // Validate packet size
     size_t min_size = sizeof(struct ipv6_header) + sizeof(struct routing_packet_header) + sizeof(struct route_entry);
     if (numbytes < (int)min_size) {
-        printf("Routing packet too short, dropping packet from %s\n", src_str);
+        printf("[Recv] Routing packet too short, dropping packet from %s\n", src_str);
         return;
     }
 
@@ -327,9 +377,9 @@ void process_routing_packet(const char *data, int numbytes, const struct in6_add
     
     // Parse advertised routes
     struct route_entry *advertised_routes = (struct route_entry *)(rp_hdr + 1);
-    
-    printf("Processing %u advertised routes from %s\n", num_advertised, src_str);
-    
+
+    printf("[Recv] Processing %u advertised routes from %s\n", num_advertised, src_str);
+
     // Process each advertised route
     size_t max_routes = (numbytes - sizeof(struct ipv6_header) - sizeof(struct routing_packet_header)) / sizeof(struct route_entry);
     for (uint32_t i = 0; i < num_advertised && i < max_routes; i++) {
@@ -341,36 +391,60 @@ void process_routing_packet(const char *data, int numbytes, const struct in6_add
 /**
  * Forward packet to next hop
  */
-void forward_packet(const char *data, int numbytes, int input_interface, const struct ipv6_header *ip6) {
+void forward_packet(const char *data, int numbytes, int tty, const struct ipv6_header *ip6) {
     char src_str[INET6_ADDRSTRLEN];
+    char dst_str[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, ip6->source, src_str, sizeof(src_str));
-    
-    printf("Packet not for this router, attempting to forward\n");
+    inet_ntop(AF_INET6, ip6->destination, dst_str, sizeof(dst_str));
+
+    printf("[Iface %d] Received packet not for this router, attempting to forward\n", tty);
 
     // Check hop limit
     if (ip6->hop_limit <= 1) {
-        printf("Hop limit reached 0, dropping packet from %s\n", src_str);
+        printf("[Iface %d] Hop limit reached 0, dropping packet from %s\n", tty, src_str);
         return;
     }
+
+    // Look up route in routing table
+    struct in6_addr dst_addr, next_hop;
+    memcpy(&dst_addr, ip6->destination, sizeof(dst_addr));
+
+    int route_idx = lookup_route(&dst_addr, &next_hop);
+    if (route_idx == -1) {
+        printf("[Iface %d] No route found for destination %s, dropping packet\n", tty, dst_str);
+        return;
+    }
+
+    char nexthop_str[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &next_hop, nexthop_str, sizeof(nexthop_str));
+    printf("[Iface %d] Found route to %s via gateway %s\n", tty, dst_str, nexthop_str);
+
+    // Find which interface can reach the next hop
+    int output_interface = find_output_interface(&next_hop);
+    if (output_interface == -1) {
+        printf("[Iface %d] Cannot find output interface for gateway %s, dropping packet\n", tty, nexthop_str);
+        return;
+    }
+
+    printf("[Iface %d] Forwarding out interface %d\n", tty, output_interface);
 
     // Make a copy of the packet for forwarding
     char *packet_copy = malloc(numbytes);
     if (packet_copy == NULL) {
-        printf("Error: Failed to allocate memory for packet copy\n");
+        printf("[Iface %d] Error: Failed to allocate memory for packet copy\n", tty);
         return;
     }
     memcpy(packet_copy, data, numbytes);
 
     // Modify hop limit in the copy
-    struct ipv6_header *ip6_copy = (struct ipv6_header *)packet_copy;
+    struct ipv6_header *ip6_copy = (struct ipv6_header *) packet_copy;
     ip6_copy->hop_limit = ip6->hop_limit - 1;
 
-    printf("Forwarding packet with decremented hop limit\n");
+    printf("[Iface %d] Forwarding packet with decremented hop limit %d\n", tty, ip6_copy->hop_limit);
     print_packet("Forwarding packet", packet_copy, numbytes);
 
-    // TODO: Implement proper routing table lookup for output interface
-    // For now, just send back out the same interface
-    queue_send(input_interface, packet_copy, numbytes);
+    // Send packet out the correct interface
+    queue_send(output_interface, packet_copy, numbytes);
     free(packet_copy);
 }
 
@@ -382,7 +456,7 @@ static void data_handler(int tty, const void *vdata, int numbytes) {
 
     // Validate IPv6 header size
     if (numbytes < (int)sizeof(struct ipv6_header)) {
-        printf("Received packet too short for IPv6 header, dropping packet\n");
+        printf("[Iface %d] Received packet too short for IPv6 header, dropping packet\n", tty);
         return;
     }
 
@@ -398,19 +472,19 @@ static void data_handler(int tty, const void *vdata, int numbytes) {
     char dst_str[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &src_addr, src_str, sizeof(src_str));
     inet_ntop(AF_INET6, &dst_addr, dst_str, sizeof(dst_str));
-    printf("Parsed IPv6 packet - src=%s, dst=%s\n", src_str, dst_str);
+    printf("[Iface %d] Parsed IPv6 packet - src=%s, dst=%s\n", src_str, dst_str);
 
     // Check if packet is for this router
     if (is_packet_for_router(ip6)) {
-        printf("Packet is for this router, processing locally\n");
+        printf("[Iface %d] Packet is for this router, processing locally\n", tty);
         
         if (ip6->next_header == 2) {
             // Routing protocol packet
             process_routing_packet(data, numbytes, &src_addr);
         } else {
             // Other protocol - just acknowledge receipt
-            printf("[%s]: Packet is not a routing packet, dropping packet from src=%s\n", 
-                   dst_str, src_str);
+            printf("[Iface %d] Packet is not a routing packet, dropping packet from src=%s\n", 
+                   tty, src_str);
         }
     } else {
         // Forward packet
